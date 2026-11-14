@@ -224,6 +224,7 @@ SdlInputHandler::~SdlInputHandler()
             SDL_RemoveTimer(m_GamepadState[i].mouseEmulationTimer);
         }
         SDL_RemoveTimer(m_GamepadState[i].startLongPressTimer);
+        SDL_RemoveTimer(m_GamepadState[i].startTapTimer);
 #if !SDL_VERSION_ATLEAST(2, 0, 9)
         if (m_GamepadState[i].haptic != nullptr) {
             SDL_HapticClose(m_GamepadState[i].haptic);

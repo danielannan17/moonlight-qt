@@ -10,6 +10,9 @@
 // How long the Start button must be pressed to toggle mouse emulation
 #define MOUSE_EMULATION_LONG_PRESS_TIME 750
 
+// Shortest press a held-back Start tap is replayed to the host with, so a game polling once a frame sees it
+#define START_TAP_MIN_TIME 50
+
 // How long between polling the gamepad to send virtual mouse input
 #define MOUSE_EMULATION_POLLING_INTERVAL 50
 
@@ -58,6 +61,15 @@ void SdlInputHandler::sendGamepadState(GamepadState* state)
 
     // Handle Select+PS as the clickpad button on PS4/5 controllers without a clickpad mapping
     int buttons = state->buttons;
+
+    // Start is kept from the host while it may still become the mouse emulation toggle,
+    // and is reported down while a held-back tap is replayed
+    if (state->startHeldBack || state->startLongPressHandled) {
+        buttons &= ~PLAY_FLAG;
+    }
+    if (state->startTapPending) {
+        buttons |= PLAY_FLAG;
+    }
     if (state->clickpadButtonEmulationEnabled) {
         if (state->buttons == (BACK_FLAG | SPECIAL_FLAG)) {
             buttons = MISC_FLAG;
@@ -154,16 +166,26 @@ void SdlInputHandler::sendGamepadBatteryState(GamepadState* state, SDL_JoystickP
     LiSendControllerBatteryEvent(state->index, batteryState, batteryPercentage);
 }
 
-Uint32 SdlInputHandler::startLongPressTimerCallback(Uint32, void *param)
+static void pushGamepadUserEvent(int code, void* param)
 {
-    // This runs on SDL's timer thread, so the toggle itself happens on the main thread
+    // Timer callbacks run on SDL's timer thread, so the work happens on the main thread
     SDL_Event event;
     SDL_zero(event);
     event.type = SDL_USEREVENT;
-    event.user.code = SDL_CODE_GAMECONTROLLER_START_LONG_PRESS;
+    event.user.code = code;
     event.user.data1 = param;
     SDL_PushEvent(&event);
+}
 
+Uint32 SdlInputHandler::startLongPressTimerCallback(Uint32, void *param)
+{
+    pushGamepadUserEvent(SDL_CODE_GAMECONTROLLER_START_LONG_PRESS, param);
+    return 0;
+}
+
+Uint32 SdlInputHandler::startTapTimerCallback(Uint32, void *param)
+{
+    pushGamepadUserEvent(SDL_CODE_GAMECONTROLLER_START_TAP_RELEASE, param);
     return 0;
 }
 
@@ -174,22 +196,15 @@ void SdlInputHandler::handleStartLongPress(SDL_JoystickID jsId)
         return;
     }
 
-    // Ignore a stale timer from an earlier press, and act only once per press
-    if (state->startLongPressHandled ||
-            !(state->buttons & PLAY_FLAG) ||
+    // Ignore a stale timer from an earlier press, or a press that became a tap or a chord
+    if (!state->startHeldBack ||
             SDL_GetTicks() - state->lastStartDownTime < MOUSE_EMULATION_LONG_PRESS_TIME) {
         return;
     }
 
-    if (state->mouseEmulationTimer == 0 && !m_GamepadMouse) {
-        return;
-    }
-
-    // This press is the toggle. Release Start on the host now (it never saw the press
-    // if mouse emulation was active), and keep it released until the button comes up.
+    // This press is the toggle, so the host never sees Start from it
+    state->startHeldBack = false;
     state->startLongPressHandled = true;
-    state->buttons &= ~PLAY_FLAG;
-    sendGamepadState(state);
 
     if (state->mouseEmulationTimer != 0) {
         SDL_RemoveTimer(state->mouseEmulationTimer);
@@ -198,6 +213,9 @@ void SdlInputHandler::handleStartLongPress(SDL_JoystickID jsId)
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "Mouse emulation deactivated");
         Session::get()->notifyMouseEmulationMode(false);
+
+        // Resync the rest of the gamepad state now that the host gets input again
+        sendGamepadState(state);
     }
     else {
         state->mouseEmulationTimer = SDL_AddTimer(MOUSE_EMULATION_POLLING_INTERVAL, SdlInputHandler::mouseEmulationTimerCallback, state);
@@ -206,6 +224,31 @@ void SdlInputHandler::handleStartLongPress(SDL_JoystickID jsId)
                     "Mouse emulation active");
         Session::get()->notifyMouseEmulationMode(true);
     }
+}
+
+void SdlInputHandler::finishStartTap(GamepadState* state)
+{
+    if (!state->startTapPending) {
+        return;
+    }
+
+    SDL_RemoveTimer(state->startTapTimer);
+    state->startTapTimer = 0;
+    state->startTapPending = false;
+
+    if (state->mouseEmulationTimer == 0) {
+        sendGamepadState(state);
+    }
+}
+
+void SdlInputHandler::handleStartTapRelease(SDL_JoystickID jsId)
+{
+    GamepadState* state = findStateForGamepad(jsId);
+    if (state == NULL) {
+        return;
+    }
+
+    finishStartTap(state);
 }
 
 Uint32 SdlInputHandler::mouseEmulationTimerCallback(Uint32 interval, void *param)
@@ -360,22 +403,35 @@ void SdlInputHandler::handleControllerButtonEvent(SDL_ControllerButtonEvent* eve
     }
 
     if (event->state == SDL_PRESSED) {
+        if (event->button == SDL_CONTROLLER_BUTTON_START) {
+            finishStartTap(state);
+        }
+
         state->buttons |= k_ButtonMap[event->button];
 
         if (event->button == SDL_CONTROLLER_BUTTON_START) {
             state->lastStartDownTime = SDL_GetTicks();
             state->startLongPressHandled = false;
 
-            // Toggle mouse emulation as soon as Start has been held long enough, not on release
+            // Hold Start back from the host until it is clear whether this press is a tap,
+            // which is replayed on release, or the mouse emulation toggle, which never reaches the host
             SDL_RemoveTimer(state->startLongPressTimer);
             state->startLongPressTimer = 0;
             if (state->mouseEmulationTimer != 0 || m_GamepadMouse) {
+                state->startHeldBack = true;
                 state->startLongPressTimer = SDL_AddTimer(MOUSE_EMULATION_LONG_PRESS_TIME,
                                                           SdlInputHandler::startLongPressTimerCallback,
                                                           (void*)(intptr_t)state->jsId);
             }
         }
-        else if (state->mouseEmulationTimer != 0) {
+        else if (state->startHeldBack && state->mouseEmulationTimer == 0) {
+            // Start held with another button is a chord for the game (or the quit combo), not the toggle
+            state->startHeldBack = false;
+            SDL_RemoveTimer(state->startLongPressTimer);
+            state->startLongPressTimer = 0;
+        }
+
+        if (event->button != SDL_CONTROLLER_BUTTON_START && state->mouseEmulationTimer != 0) {
             if (event->button == SDL_CONTROLLER_BUTTON_A) {
                 LiSendMouseButtonEvent(BUTTON_ACTION_PRESS, BUTTON_LEFT);
             }
@@ -412,6 +468,18 @@ void SdlInputHandler::handleControllerButtonEvent(SDL_ControllerButtonEvent* eve
             SDL_RemoveTimer(state->startLongPressTimer);
             state->startLongPressTimer = 0;
             state->startLongPressHandled = false;
+
+            if (state->startHeldBack) {
+                state->startHeldBack = false;
+
+                // A tap: the host gets the press now, and the release as long after as Start was held
+                if (state->mouseEmulationTimer == 0) {
+                    state->startTapPending = true;
+                    state->startTapTimer = SDL_AddTimer(SDL_max(SDL_GetTicks() - state->lastStartDownTime, (Uint32)START_TAP_MIN_TIME),
+                                                        SdlInputHandler::startTapTimerCallback,
+                                                        (void*)(intptr_t)state->jsId);
+                }
+            }
         }
         else if (state->mouseEmulationTimer != 0) {
             if (event->button == SDL_CONTROLLER_BUTTON_A) {
@@ -827,6 +895,7 @@ void SdlInputHandler::handleControllerDeviceEvent(SDL_ControllerDeviceEvent* eve
                 SDL_RemoveTimer(state->mouseEmulationTimer);
             }
             SDL_RemoveTimer(state->startLongPressTimer);
+            SDL_RemoveTimer(state->startTapTimer);
 
             SDL_GameControllerClose(state->controller);
 

@@ -7,6 +7,8 @@
 
 // Pushed to the main loop when a gamepad's Start button has been held long enough to toggle mouse emulation
 #define SDL_CODE_GAMECONTROLLER_START_LONG_PRESS 106
+// Pushed to the main loop when a held-back Start tap, replayed to the host, should be released
+#define SDL_CODE_GAMECONTROLLER_START_TAP_RELEASE 107
 
 struct GamepadState {
     SDL_GameController* controller;
@@ -21,8 +23,11 @@ struct GamepadState {
 
     SDL_TimerID mouseEmulationTimer;
     SDL_TimerID startLongPressTimer;
+    SDL_TimerID startTapTimer;
     uint32_t lastStartDownTime;
+    bool startHeldBack;
     bool startLongPressHandled;
+    bool startTapPending;
 
     bool clickpadButtonEmulationEnabled;
     bool emulatedClickpadButtonDown;
@@ -110,6 +115,10 @@ public:
     void handleControllerDeviceEvent(SDL_ControllerDeviceEvent* event);
 
     void handleStartLongPress(SDL_JoystickID jsId);
+
+    void handleStartTapRelease(SDL_JoystickID jsId);
+
+    void finishStartTap(GamepadState* state);
 
 #if SDL_VERSION_ATLEAST(2, 0, 14)
     void handleControllerSensorEvent(SDL_ControllerSensorEvent* event);
@@ -203,6 +212,9 @@ private:
 
     static
     Uint32 startLongPressTimerCallback(Uint32 interval, void* param);
+
+    static
+    Uint32 startTapTimerCallback(Uint32 interval, void* param);
 
     static
     Uint32 releaseLeftButtonTimerCallback(Uint32 interval, void* param);

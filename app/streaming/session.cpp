@@ -2039,6 +2039,9 @@ void Session::exec()
             case SDL_CODE_GAMECONTROLLER_START_LONG_PRESS:
                 m_InputHandler->handleStartLongPress((SDL_JoystickID)(intptr_t)event.user.data1);
                 break;
+            case SDL_CODE_GAMECONTROLLER_START_TAP_RELEASE:
+                m_InputHandler->handleStartTapRelease((SDL_JoystickID)(intptr_t)event.user.data1);
+                break;
             default:
                 SDL_assert(false);
             }
