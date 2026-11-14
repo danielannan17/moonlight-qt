@@ -154,6 +154,60 @@ void SdlInputHandler::sendGamepadBatteryState(GamepadState* state, SDL_JoystickP
     LiSendControllerBatteryEvent(state->index, batteryState, batteryPercentage);
 }
 
+Uint32 SdlInputHandler::startLongPressTimerCallback(Uint32, void *param)
+{
+    // This runs on SDL's timer thread, so the toggle itself happens on the main thread
+    SDL_Event event;
+    SDL_zero(event);
+    event.type = SDL_USEREVENT;
+    event.user.code = SDL_CODE_GAMECONTROLLER_START_LONG_PRESS;
+    event.user.data1 = param;
+    SDL_PushEvent(&event);
+
+    return 0;
+}
+
+void SdlInputHandler::handleStartLongPress(SDL_JoystickID jsId)
+{
+    GamepadState* state = findStateForGamepad(jsId);
+    if (state == NULL) {
+        return;
+    }
+
+    // Ignore a stale timer from an earlier press, and act only once per press
+    if (state->startLongPressHandled ||
+            !(state->buttons & PLAY_FLAG) ||
+            SDL_GetTicks() - state->lastStartDownTime < MOUSE_EMULATION_LONG_PRESS_TIME) {
+        return;
+    }
+
+    if (state->mouseEmulationTimer == 0 && !m_GamepadMouse) {
+        return;
+    }
+
+    // This press is the toggle. Release Start on the host now (it never saw the press
+    // if mouse emulation was active), and keep it released until the button comes up.
+    state->startLongPressHandled = true;
+    state->buttons &= ~PLAY_FLAG;
+    sendGamepadState(state);
+
+    if (state->mouseEmulationTimer != 0) {
+        SDL_RemoveTimer(state->mouseEmulationTimer);
+        state->mouseEmulationTimer = 0;
+
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Mouse emulation deactivated");
+        Session::get()->notifyMouseEmulationMode(false);
+    }
+    else {
+        state->mouseEmulationTimer = SDL_AddTimer(MOUSE_EMULATION_POLLING_INTERVAL, SdlInputHandler::mouseEmulationTimerCallback, state);
+
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Mouse emulation active");
+        Session::get()->notifyMouseEmulationMode(true);
+    }
+}
+
 Uint32 SdlInputHandler::mouseEmulationTimerCallback(Uint32 interval, void *param)
 {
     auto gamepad = reinterpret_cast<GamepadState*>(param);
@@ -310,6 +364,16 @@ void SdlInputHandler::handleControllerButtonEvent(SDL_ControllerButtonEvent* eve
 
         if (event->button == SDL_CONTROLLER_BUTTON_START) {
             state->lastStartDownTime = SDL_GetTicks();
+            state->startLongPressHandled = false;
+
+            // Toggle mouse emulation as soon as Start has been held long enough, not on release
+            SDL_RemoveTimer(state->startLongPressTimer);
+            state->startLongPressTimer = 0;
+            if (state->mouseEmulationTimer != 0 || m_GamepadMouse) {
+                state->startLongPressTimer = SDL_AddTimer(MOUSE_EMULATION_LONG_PRESS_TIME,
+                                                          SdlInputHandler::startLongPressTimerCallback,
+                                                          (void*)(intptr_t)state->jsId);
+            }
         }
         else if (state->mouseEmulationTimer != 0) {
             if (event->button == SDL_CONTROLLER_BUTTON_A) {
@@ -345,26 +409,9 @@ void SdlInputHandler::handleControllerButtonEvent(SDL_ControllerButtonEvent* eve
         state->buttons &= ~k_ButtonMap[event->button];
 
         if (event->button == SDL_CONTROLLER_BUTTON_START) {
-            if (SDL_GetTicks() - state->lastStartDownTime > MOUSE_EMULATION_LONG_PRESS_TIME) {
-                if (state->mouseEmulationTimer != 0) {
-                    SDL_RemoveTimer(state->mouseEmulationTimer);
-                    state->mouseEmulationTimer = 0;
-
-                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                                "Mouse emulation deactivated");
-                    Session::get()->notifyMouseEmulationMode(false);
-                }
-                else if (m_GamepadMouse) {
-                    // Send the start button up event to the host, since we won't do it below
-                    sendGamepadState(state);
-
-                    state->mouseEmulationTimer = SDL_AddTimer(MOUSE_EMULATION_POLLING_INTERVAL, SdlInputHandler::mouseEmulationTimerCallback, state);
-
-                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                                "Mouse emulation active");
-                    Session::get()->notifyMouseEmulationMode(true);
-                }
-            }
+            SDL_RemoveTimer(state->startLongPressTimer);
+            state->startLongPressTimer = 0;
+            state->startLongPressHandled = false;
         }
         else if (state->mouseEmulationTimer != 0) {
             if (event->button == SDL_CONTROLLER_BUTTON_A) {
@@ -779,6 +826,7 @@ void SdlInputHandler::handleControllerDeviceEvent(SDL_ControllerDeviceEvent* eve
                 Session::get()->notifyMouseEmulationMode(false);
                 SDL_RemoveTimer(state->mouseEmulationTimer);
             }
+            SDL_RemoveTimer(state->startLongPressTimer);
 
             SDL_GameControllerClose(state->controller);
 
